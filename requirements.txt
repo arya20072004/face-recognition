@@ -8,9 +8,9 @@
 
 streamlit
 deepface
-numpy==1.24.3
 Pillow
 opencv-python-headless
 streamlit-webrtc
 av
 pandas
+
