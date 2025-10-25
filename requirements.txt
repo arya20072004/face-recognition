@@ -9,8 +9,7 @@
 streamlit
 deepface
 Pillow
-opencv-python-headless
+opencv-python
 streamlit-webrtc
 av
 pandas
-
