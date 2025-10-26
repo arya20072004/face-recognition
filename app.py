@@ -1,197 +1,236 @@
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
-import tensorflow as tf
-import cv2
 import os
-from tqdm import tqdm
+import pandas as pd
+from deepface import DeepFace
+from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, RTCConfiguration
+import av
+import cv2
 
-# --- Configuration & Model Loading ---
-st.set_page_config(layout="wide", page_title="Face Recognition and Emotion Analysis")
-st.title("Face Recognition & Emotion Analysis Framework")
+# ==============================================================================
+# --- 1. CONFIGURATION ---
+# ==============================================================================
+st.set_page_config(layout="wide", page_title="Advanced Face Analysis")
 
-# --- Model Paths ---
-RECOGNITION_MODEL_PATH = 'lfw_recognition_model.h5'
-EMOTION_MODEL_PATH = 'affectnet_emotion_model.h5'
-CASCADE_PATH = 'haarcascade_frontalface_default.xml'
+st.title("✨ Advanced Multi-Face & Real-Time Analysis")
+st.write("Upload an image or use your webcam to detect and analyze multiple faces for identity, emotion, age, and gender.")
 
-# --- Emotion Recognition Configuration ---
-EMOTION_IMG_SIZE = (48, 48)
-EMOTION_LABELS = ['angry', 'disgust', 'fear', 'happy', 'neutral', 'sad', 'surprise']
+# --- Paths & Models ---
+DATABASE_PATH = "lfw-subset-large/"
 
-# --- Face Recognition Configuration ---
-RECOGNITION_IMG_SIZE = (105, 105)
-LFW_DATASET_DIR = os.path.join('lfw_dataset', 'lfw-deepfunneled', 'lfw-deepfunneled')
-RECOGNITION_THRESHOLD = 0.8 # Lower value means stricter matching
+# --- DeepFace Configuration ---
+RECOGNITION_MODEL = "ArcFace"
+
+# ==============================================================================
+# --- 2. WEBCAM & HELPER CLASSES ---
+# ==============================================================================
+
+class VideoTransformer(VideoTransformerBase):
+    """
+    Processes video frames from the webcam for real-time analysis.
+    """
+    def __init__(self):
+        self.frame_counter = 0
+
+    def transform(self, frame: av.VideoFrame) -> np.ndarray:
+        image_np = frame.to_ndarray(format="bgr24")
+        self.frame_counter += 1
+
+        # Process every 5th frame for performance
+        if self.frame_counter % 5 == 0:
+            try:
+                analysis_results = DeepFace.analyze(
+                    img_path=image_np,
+                    actions=['emotion', 'age', 'gender'],
+                    enforce_detection=False,
+                    silent=True
+                )
+                analysis_results = [res for res in analysis_results if res is not None and res.get('region')]
+
+                for face in analysis_results:
+                    box = face['region']
+                    x, y, w, h = box['x'], box['y'], box['w'], box['h']
+                    
+                    label = f"{face['dominant_emotion']}"
+                    cv2.rectangle(image_np, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    cv2.putText(image_np, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                    
+                    sub_label = f"Age: {face['age']}, {face['dominant_gender']}"
+                    cv2.putText(image_np, sub_label, (x, y + h + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+                return image_np
+            except Exception:
+                return image_np
+        
+        return image_np
 
 @st.cache_resource
-def load_models():
-    """Load all models and classifiers into memory and cache them."""
-    if not os.path.exists(CASCADE_PATH):
-        st.error(f"Error: Cascade classifier not found at '{CASCADE_PATH}'")
-        return None, None, None
-    if not os.path.exists(EMOTION_MODEL_PATH):
-        st.error(f"Error: Emotion model not found at '{EMOTION_MODEL_PATH}'. Please train it first.")
-        return None, None, None
-    if not os.path.exists(RECOGNITION_MODEL_PATH):
-        st.error(f"Error: Recognition model not found at '{RECOGNITION_MODEL_PATH}'. Please train it first.")
-        return None, None, None
-        
-    face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
-    emotion_model = tf.keras.models.load_model(EMOTION_MODEL_PATH)
-    recognition_model = tf.keras.models.load_model(RECOGNITION_MODEL_PATH)
-    return face_cascade, emotion_model, recognition_model
-
-face_cascade, emotion_model, recognition_model = load_models()
-
-# --- Preprocessing Functions ---
-def preprocess_image_for_emotion(face_roi):
-    """Preprocess a single face image for the emotion model."""
-    gray_face = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
-    resized_face = cv2.resize(gray_face, EMOTION_IMG_SIZE)
-    processed_face = resized_face.astype('float32') / 255.0
-    processed_face = np.expand_dims(processed_face, axis=0)
-    processed_face = np.expand_dims(processed_face, axis=-1)
-    return processed_face
-
-def preprocess_image_for_recognition(face_roi):
-    """Preprocess a single face image for the recognition model."""
-    resized_face = cv2.resize(face_roi, RECOGNITION_IMG_SIZE)
-    processed_face = resized_face.astype('float32') / 255.0
-    processed_face = np.expand_dims(processed_face, axis=0)
-    return processed_face
-    
-@st.cache_data
-def create_known_face_encodings(_recognition_model):
-    """Create a database of known face embeddings from the LFW dataset."""
-    if not os.path.exists(LFW_DATASET_DIR):
-        st.warning("LFW dataset directory not found. Recognition will not be available.")
-        return {}, {}
-        
-    known_face_encodings = {}
-    person_image_paths = {}
-
-    people_list = [p for p in os.listdir(LFW_DATASET_DIR) if os.path.isdir(os.path.join(LFW_DATASET_DIR, p))]
-    
-    progress_bar = st.progress(0, text="Building face recognition database...")
-    
-    for i, person_name in enumerate(people_list):
-        person_dir = os.path.join(LFW_DATASET_DIR, person_name)
-        person_images = [os.path.join(person_dir, img) for img in os.listdir(person_dir)]
-        
-        if not person_images:
-            continue
-            
-        # Use the first image as the reference for this person
-        first_image_path = person_images[0]
-        try:
-            img = cv2.imread(first_image_path)
-            if img is None: continue
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            processed_img = preprocess_image_for_recognition(img_rgb)
-            embedding = _recognition_model.predict(processed_img, verbose=0)[0]
-            known_face_encodings[person_name] = embedding
-            person_image_paths[person_name] = first_image_path
-        except Exception:
-            continue # Skip if an image is corrupted
-            
-        progress_bar.progress((i + 1) / len(people_list), text=f"Processing {person_name}...")
-        
-    progress_bar.empty()
-    return known_face_encodings, person_image_paths
-
-
-if recognition_model:
-    known_face_encodings, person_image_paths = create_known_face_encodings(recognition_model)
-else:
-    known_face_encodings, person_image_paths = {}, {}
-
-
-def find_match(embedding, known_encodings, threshold):
-    """Find the best match for an embedding in the known encodings database."""
-    distances = {}
-    for name, known_embedding in known_encodings.items():
-        distance = np.linalg.norm(embedding - known_embedding)
-        distances[name] = distance
-        
-    if not distances:
-        return "Unknown", float('inf')
-        
-    best_match_name = min(distances, key=distances.get)
-    best_match_distance = distances[best_match_name]
-
-    if best_match_distance < threshold:
-        return best_match_name, best_match_distance
-    else:
-        return "Unknown", best_match_distance
-
-# --- Streamlit UI ---
-col1, col2 = st.columns(2)
-
-with col1:
-    st.header("Upload Image")
-    uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png"])
-    
-if uploaded_file is not None and all([face_cascade, emotion_model, recognition_model]):
-    # Convert the uploaded file to an OpenCV image
-    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-    image_bgr = cv2.imdecode(file_bytes, 1)
-    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    gray_image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    
-    with col1:
-        st.image(image_rgb, caption='Uploaded Image', use_column_width=True)
-
-    # Detect faces
-    faces = face_cascade.detectMultiScale(gray_image, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
-
-    img_pil = Image.fromarray(image_rgb)
-    draw = ImageDraw.Draw(img_pil)
-    
+def get_font():
+    """Load a font for drawing on images, with a fallback."""
     try:
-        font = ImageFont.truetype("arial.ttf", 20)
+        return ImageFont.truetype("arial.ttf", 22)
     except IOError:
-        font = ImageFont.load_default()
+        return ImageFont.load_default()
+
+def resize_image(image, max_size=(800, 800)):
+    """
+    Resizes a PIL Image to fit within a max_size box while maintaining aspect ratio.
+    """
+    img_copy = image.copy()
+    img_copy.thumbnail(max_size, Image.Resampling.LANCZOS)
+    return img_copy
+
+# ==============================================================================
+# --- 3. CORE PROCESSING FUNCTION ---
+# ==============================================================================
+
+def process_and_display_results(image_np, analysis_results, distance_threshold):
+    """
+    Processes analysis results, finds identities, draws on the image, and displays it.
+    """
+    original_image = Image.fromarray(image_np)
+    img_to_draw = original_image.copy()
+    draw = ImageDraw.Draw(img_to_draw)
+    font = get_font()
+
+    all_find_results = []
+
+    for face in analysis_results:
+        box = face['region']
+        x, y, w, h = box['x'], box['y'], box['w'], box['h']
+        
+        cropped_face_np_rgb = image_np[y:y+h, x:x+w]
+        cropped_face_np_bgr = cv2.cvtColor(cropped_face_np_rgb, cv2.COLOR_RGB2BGR)
+
+        try:
+            result_df_list = DeepFace.find(
+                img_path=cropped_face_np_bgr,
+                db_path=DATABASE_PATH,
+                model_name=RECOGNITION_MODEL,
+                enforce_detection=False,
+                silent=True
+            )
+            
+            if result_df_list and not result_df_list[0].empty:
+                top_match = result_df_list[0].iloc[0]
+                distance = top_match['distance']
+                
+                if distance < distance_threshold:
+                    identity_path = top_match['identity']
+                    identity_name = os.path.basename(os.path.dirname(identity_path))
+                    all_find_results.append({"identity": identity_name, "distance": distance})
+                else:
+                    closest_identity_path = top_match['identity']
+                    closest_name = os.path.basename(os.path.dirname(closest_identity_path))
+                    all_find_results.append({"identity": "Unknown", "distance": distance, "closest_match": closest_name})
+            else:
+                all_find_results.append({"identity": "Unknown", "distance": float('inf')})
+
+        except Exception as e:
+             st.toast(f"Error during face search: {e}", icon="⚠️")
+             all_find_results.append({"identity": "Error", "distance": float('inf')})
+
+    for i, face in enumerate(analysis_results):
+        box = face['region']
+        x, y, w, h = box['x'], box['y'], box['w'], box['h']
+        identity_info = all_find_results[i]
+        identity = identity_info['identity']
+        
+        box_color = "lime" if identity != "Unknown" else "red"
+        label = f"{identity} ({face['dominant_emotion']})"
+        
+        draw.rectangle([x, y, x + w, y + h], outline=box_color, width=3)
+        text_bbox = draw.textbbox((x, y - 30), label, font=font)
+        draw.rectangle(text_bbox, fill=box_color)
+        draw.text((x + 5, y - 28), label, fill="black", font=font)
+
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        st.header("🖼️ Processed Image")
+        # --- MODIFIED: Resize the image before displaying for a cleaner UI ---
+        resized_image = resize_image(img_to_draw)
+        st.image(resized_image, caption="Analysis Result")
 
     with col2:
-        st.header("Analysis Results")
-        if len(faces) == 0:
-            st.warning("No faces detected in the image.")
+        st.header("🔍 Analysis Details")
+        if not analysis_results:
+            st.warning("No faces were detected.")
         else:
-            st.info(f"Detected {len(faces)} face(s).")
-            # Create a layout for each face
-            for i, (x, y, w, h) in enumerate(faces):
-                st.markdown(f"---")
-                st.subheader(f"Face #{i+1}")
-                
-                # --- Emotion Analysis ---
-                face_roi_bgr = image_bgr[y:y+h, x:x+w]
-                processed_emotion_face = preprocess_image_for_emotion(face_roi_bgr)
-                emotion_prediction = emotion_model.predict(processed_emotion_face, verbose=0)[0]
-                dominant_emotion = EMOTION_LABELS[np.argmax(emotion_prediction)]
+            st.info(f"Detected {len(analysis_results)} face(s).")
+            for i, face in enumerate(analysis_results):
+                identity_info = all_find_results[i]
+                with st.expander(f"**Face #{i+1}**: {identity_info['identity']}"):
+                    st.write(f"**Identity:** {identity_info['identity']}")
+                    if identity_info['identity'] != "Unknown":
+                        st.write(f"**Match Confidence (Distance):** {identity_info['distance']:.4f}")
+                    elif "closest_match" in identity_info:
+                         st.warning(f"Closest match was '{identity_info['closest_match']}' with distance {identity_info['distance']:.4f}, which is above the threshold.")
+                    
+                    st.write(f"**Dominant Emotion:** {face['dominant_emotion'].capitalize()}")
+                    st.write(f"**Estimated Age:** {face['age']}")
+                    st.write(f"**Estimated Gender:** {face['dominant_gender'].capitalize()}")
+                    
+                    st.write("**Emotion Scores:**")
+                    emotion_df = pd.DataFrame(face['emotion'].items(), columns=['Emotion', 'Confidence'])
+                    st.bar_chart(emotion_df.set_index('Emotion'))
 
-                # --- Recognition Analysis ---
-                if known_face_encodings:
-                    face_roi_rgb = image_rgb[y:y+h, x:x+w]
-                    processed_recognition_face = preprocess_image_for_recognition(face_roi_rgb)
-                    embedding = recognition_model.predict(processed_recognition_face, verbose=0)[0]
-                    name, distance = find_match(embedding, known_face_encodings, RECOGNITION_THRESHOLD)
-                    label_text = f"{name} ({dominant_emotion.capitalize()})"
-                else:
-                    name = "N/A"
-                    distance = float('inf')
-                    label_text = f"{dominant_emotion.capitalize()}"
-                
-                # Display text results
-                st.write(f"**Recognized As:** {name} (Distance: {distance:.2f})")
-                st.write(f"**Predicted Emotion:** {dominant_emotion.capitalize()}")
+# ==============================================================================
+# --- 4. STREAMLIT UI ---
+# ==============================================================================
+if not os.path.exists(DATABASE_PATH):
+    st.error(f"Database path not found: '{DATABASE_PATH}'. Please ensure the directory exists.")
+    st.stop()
 
-                # Draw on the image
-                draw.rectangle([(x, y), (x+w, y+h)], outline="lime", width=3)
-                text_size = draw.textlength(label_text, font)
-                draw.rectangle([(x, y-25), (x + text_size + 8, y)], fill="lime")
-                draw.text((x + 5, y - 22), label_text, fill="black", font=font)
-            
-            st.markdown(f"---")
-            st.image(img_pil, caption='Processed Image', use_column_width=True)
+st.sidebar.header("⚙️ Settings")
+
+distance_threshold = st.sidebar.slider(
+    'Recognition Confidence Threshold',
+    min_value=0.0, max_value=2.0, value=0.68, step=0.01,
+    help="Lower values mean stricter matching. ArcFace models work best around 0.68."
+)
+
+tab1, tab2 = st.tabs(["📤 Upload Image", "📹 Live Webcam Analysis"])
+
+with tab1:
+    st.sidebar.header("Image Upload")
+    uploaded_file = st.sidebar.file_uploader("Choose an image...", type=["jpg", "jpeg", "png"])
+    
+    st.sidebar.info(
+        "**How It Works:**\n\n"
+        "1. **Detection & Analysis:** Finds all faces and analyzes their attributes.\n"
+        "2. **Recognition:** Each face is individually compared against the database.\n"
+        f"3. **Verification:** A match is confirmed if its distance is below the set threshold."
+    )
+
+    if uploaded_file is not None:
+        try:
+            image = Image.open(uploaded_file).convert("RGB")
+            image_np = np.array(image)
+
+            with st.spinner('Analyzing image... This may take a moment.'):
+                analysis_results = DeepFace.analyze(
+                    img_path=image_np,
+                    actions=['emotion', 'age', 'gender'],
+                    enforce_detection=False,
+                    silent=True
+                )
+                analysis_results = [res for res in analysis_results if res is not None and res.get('region')]
+                process_and_display_results(image_np, analysis_results, distance_threshold)
+                
+        except Exception as e:
+            st.error(f"An error occurred during analysis: {e}")
+    else:
+        st.info("Please upload an image to begin analysis.")
+
+with tab2:
+    st.header("Live Webcam Feed")
+    st.info("Allow webcam access, then click 'Start' to begin real-time analysis.")
+    st.warning("Recognition is disabled in live mode for performance.")
+
+    webrtc_streamer(
+        key="webcam",
+        video_transformer_factory=VideoTransformer,
+        rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
+    )
 
